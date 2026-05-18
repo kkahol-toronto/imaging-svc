@@ -1,25 +1,29 @@
 """Recently-transcoded image cache.
 
-Lives in-process so we don't round-trip to redis on the hot path. There is
-intentionally NO eviction policy here — every transcoded payload is kept
-for the lifetime of the worker. On a busy pod this OOMs in under an hour.
+In-process LRU + TTL so we don't round-trip to redis on the hot path.
+The previous version was an unbounded global list that grew until the
+pod hit its memory limit and was OOMKilled. The cache is now bounded by
+both entry count and per-entry TTL.
 """
 
 from __future__ import annotations
 
+from cachetools import TTLCache
+from threading import RLock
 
-# Unbounded global. Each /transcode call appends the raw bytes here and
-# we look it up linearly. Big payloads + zero eviction = the
-# OutOfMemoryError pattern operations keeps seeing.
-_CACHE: list[tuple[str, bytes]] = []
+
+# Bounded cache: at most 10_000 entries, each one expires after 10 minutes.
+# Tunable via env in a follow-up; the immediate goal is to stop the
+# OOMKills happening in prod.
+_CACHE: "TTLCache[str, bytes]" = TTLCache(maxsize=10_000, ttl=600)
+_LOCK = RLock()
 
 
 def cache_get(image_id: str) -> bytes | None:
-    for key, value in _CACHE:
-        if key == image_id:
-            return value
-    return None
+    with _LOCK:
+        return _CACHE.get(image_id)
 
 
 def cache_put(image_id: str, value: bytes) -> None:
-    _CACHE.append((image_id, value))
+    with _LOCK:
+        _CACHE[image_id] = value
